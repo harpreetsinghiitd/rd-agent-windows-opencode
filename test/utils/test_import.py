@@ -1,9 +1,37 @@
 import importlib
-import os
 import unittest
 from pathlib import Path
 
 import pytest
+
+_EXCLUDED_ENTRYPOINTS = {
+    ("app", "cli.py"),
+    ("app", "CI", "run.py"),
+    ("app", "utils", "ape.py"),
+    ("log", "ui", "utils.py"),
+}
+
+
+def module_name_from_file(file: Path, package_root: Path) -> str:
+    """Convert a Python file path under the package root to a dotted import path."""
+    relative = file.relative_to(package_root).with_suffix("")
+    return ".".join((package_root.name, *relative.parts))
+
+
+def should_skip_module(relative: Path) -> bool:
+    """Return whether a package-relative module path is unsafe for import-all tests."""
+    parts = relative.parts
+    return (
+        any("example" in part for part in parts)
+        or any("meta_tpl" in part for part in parts)
+        or ("autorl_bench" in parts and "workspace" in parts)
+        or any("template" in part or "tpl" in part for part in parts)
+        or any("model_coder" in part for part in parts)
+        or any("llm_st" in part for part in parts)
+        or Path("log/ui") in relative.parents
+        or parts in _EXCLUDED_ENTRYPOINTS
+        or any("extract_parameters" in part for part in parts)
+    )
 
 
 @pytest.mark.offline
@@ -15,36 +43,12 @@ class TestRDAgentImports(unittest.TestCase):
 
     @staticmethod
     def import_all_modules_from_directory(directory):
-        for file in directory.joinpath("rdagent").rglob("*.py"):
-            fstr = str(file)
-            if "example" in fstr:
+        package_root = directory / "rdagent"
+        for file in package_root.rglob("*.py"):
+            relative = file.relative_to(package_root)
+            if should_skip_module(relative):
                 continue
-            if "meta_tpl" in fstr:
-                continue
-            if "autorl_bench/workspace/" in fstr:
-                continue
-            if "template" in fstr or "tpl" in fstr:
-                continue
-            if "model_coder" in fstr:
-                continue
-            if "llm_st" in fstr:
-                continue
-            if (
-                "rdagent/log/ui/" in fstr
-                or fstr.endswith("rdagent/app/cli.py")
-                or fstr.endswith("rdagent/app/CI/run.py")
-                or fstr.endswith("rdagent/app/utils/ape.py")
-                or fstr.endswith("rdagent/log/ui/utils.py")
-            ):
-                # the entrance points
-                continue
-            # llamafactory==0.9.3 pins numpy to an older version, causing other
-            # installations to fail. The `extract_parameters` tests are therefore
-            # temporarily disabled and can be re-enabled once the numpy constraint is relaxed.
-            if "extract_parameters" in fstr:
-                continue
-
-            yield fstr[fstr.index("rdagent") : -3].replace("/", ".")
+            yield module_name_from_file(file, package_root)
 
     def test_import_modules(self):
         print(self.modules)

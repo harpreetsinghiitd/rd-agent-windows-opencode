@@ -5,53 +5,46 @@ Tries to create uniform environment for the agent to run;
 - All the code and data is expected included in one folder
 """
 
-# TODO: move the scenario specific docker env into other folders.
+from __future__ import annotations
 
+# TODO: move the scenario specific docker env into other folders.
 import contextlib
 import json
 import os
+import posixpath
+import queue
 import re
 import select
 import shutil
 import subprocess
+import tempfile
+import threading
 import time
 import uuid
 import zipfile
 from abc import abstractmethod
 from collections import deque
+from collections.abc import Callable, Generator, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import (
     Any,
-    Callable,
-    Deque,
-    Dict,
-    Generator,
     Generic,
-    Iterable,
-    Mapping,
-    Optional,
     TypeVar,
     cast,
 )
 
-import docker  # type: ignore[import-untyped]
-import docker.models  # type: ignore[import-untyped]
-import docker.models.containers  # type: ignore[import-untyped]
-import docker.types  # type: ignore[import-untyped]
-from pydantic import BaseModel, model_validator
+try:
+    import docker  # type: ignore[import-untyped]
+    import docker.models  # type: ignore[import-untyped]
+    import docker.models.containers  # type: ignore[import-untyped]
+    import docker.types  # type: ignore[import-untyped]
+except ImportError:  # Docker is optional for the native LocalEnv backend.
+    docker = None  # type: ignore[assignment]
+from pydantic import model_validator
 from pydantic_settings import SettingsConfigDict
-from rich import print
-from rich.console import Console
-from rich.live import Live
-from rich.progress import Progress, SpinnerColumn, TextColumn
-from rich.rule import Rule
-from rich.table import Table
-from rich.text import Text
-from tqdm import tqdm
-
 from rdagent.core.conf import ExtendedBaseSettings
 from rdagent.core.experiment import RD_AGENT_SETTINGS
 from rdagent.core.serialization import UntrustedArtifactError
@@ -64,6 +57,13 @@ from rdagent.utils import filter_redundant_text
 from rdagent.utils.agent.tpl import T
 from rdagent.utils.fmt import shrink_text
 from rdagent.utils.workflow import wait_retry
+from rich import print
+from rich.console import Console
+from rich.live import Live
+from rich.rule import Rule
+from rich.table import Table
+from rich.text import Text
+from tqdm import tqdm
 
 CacheKeyFunc = Callable[[str | Path], list[list[str]]]
 
@@ -92,7 +92,7 @@ def extract_dir_name_from_path_config(path_str: str) -> str:
     return ""
 
 
-def cleanup_container(container: docker.models.containers.Container | None, context: str = "") -> None:  # type: ignore[no-any-unimported]
+def cleanup_container(container: Any | None, context: str = "") -> None:
     """
     Shared helper function to clean up a Docker container.
     Always stops the container before removing it.
@@ -121,9 +121,19 @@ def normalize_volumes(vols: dict[str, str | dict[str, str]], working_dir: str) -
 
     def to_abs(path: str) -> str:
         # Converts a relative path to an absolute path using the workspace (working_dir).
+        # A POSIX-style absolute path is a *container* path (e.g. /kaggle/workspace/...);
+        # on Windows os.path.abspath would rewrite it to C:\kaggle\..., which Docker rejects.
+        if path.startswith("/"):
+            return path
+        if working_dir.startswith("/"):
+            # The workspace lives inside the container, so join with POSIX semantics.
+            return posixpath.normpath(posixpath.join(working_dir, path))
         return os.path.abspath(os.path.join(working_dir, path)) if not os.path.isabs(path) else path
 
-    for lp, vinfo in vols.items():
+    for lp, vinfo in list(vols.items()):
+        # A relative host path would be treated by Docker as a named volume.
+        if not os.path.isabs(lp) and not lp.startswith("/"):
+            lp = os.path.abspath(lp)
         # Support both:
         # 1. {'host_path': {'bind': 'container_path', ...}}
         # 2. {'host_path': 'container_path'}
@@ -138,8 +148,173 @@ def normalize_volumes(vols: dict[str, str | dict[str, str]], working_dir: str) -
     return abs_vols
 
 
+def _remove_path(path: Path) -> None:
+    if path.is_symlink() or not path.is_dir():
+        path.unlink(missing_ok=True)
+    else:
+        shutil.rmtree(path)
+
+
+def _prepare_volume_target(link_path: Path) -> None:
+    """Remove an obsolete symlink but never replace an existing host path."""
+    if link_path.is_symlink():
+        link_path.unlink()
+    elif link_path.exists():
+        raise FileExistsError(f"Refusing to replace an existing volume target: {link_path}")
+
+
+def _reject_host_volume_symlinks(host_path: Path) -> None:
+    """Reject links before Windows staging, which otherwise dereferences them."""
+    if host_path.is_symlink() or (host_path.is_dir() and any(path.is_symlink() for path in host_path.rglob("*"))):
+        msg = f"Refusing to stage host volume containing symlinks: {host_path}"
+        raise RuntimeError(msg)
+
+
+def _mirror_staged_directory(staged_path: Path, host_path: Path) -> None:
+    """Apply staged directory changes, including deletions, to the host mount."""
+    if staged_path.is_symlink():
+        msg = f"Refusing to copy back a replaced staged volume root: {staged_path}"
+        raise RuntimeError(msg)
+    if not host_path.exists():
+        host_path.mkdir(parents=True, exist_ok=True)
+    if not staged_path.exists():
+        for child in host_path.iterdir():
+            _remove_path(child)
+        return
+    if not staged_path.is_dir():
+        msg = f"Refusing to copy back a replaced staged volume root: {staged_path}"
+        raise RuntimeError(msg)
+    if any(child.is_symlink() for child in staged_path.rglob("*")):
+        msg = f"Refusing to copy back symlinks from staged volume: {staged_path}"
+        raise RuntimeError(msg)
+
+    def remove_missing_or_changed(source: Path, staged: Path) -> None:
+        for source_child in source.iterdir():
+            staged_child = staged / source_child.name
+            if not staged_child.exists() and not staged_child.is_symlink():
+                _remove_path(source_child)
+                continue
+            if source_child.is_symlink() or staged_child.is_symlink():
+                _remove_path(source_child)
+                continue
+            source_is_dir = source_child.is_dir()
+            staged_is_dir = staged_child.is_dir()
+            if source_is_dir != staged_is_dir:
+                _remove_path(source_child)
+            elif source_is_dir:
+                remove_missing_or_changed(source_child, staged_child)
+
+    remove_missing_or_changed(host_path, staged_path)
+    shutil.copytree(staged_path, host_path, dirs_exist_ok=True, symlinks=True)
+
+
+def _cleanup_staged_volume(
+    link_path: Path, real_path: Path, writable: bool, is_directory: bool, staged_ready: bool
+) -> None:
+    try:
+        if staged_ready and writable and real_path.exists():
+            if is_directory:
+                _mirror_staged_directory(link_path, real_path)
+            elif link_path.exists() or link_path.is_symlink():
+                if link_path.is_symlink():
+                    msg = f"Refusing to copy back a staged file symlink: {link_path}"
+                    raise RuntimeError(msg)
+                real_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(link_path, real_path)
+            else:
+                real_path.unlink(missing_ok=True)
+    finally:
+        if link_path.is_dir() and not link_path.is_symlink():
+            shutil.rmtree(link_path)
+        else:
+            link_path.unlink(missing_ok=True)
+
+
+def _cleanup_staged_volumes(created_links: list[tuple[Path, Path, bool, bool, bool]]) -> None:
+    cleanup_errors: list[Exception] = []
+    for link_path, real_path, writable, is_directory, staged_ready in reversed(created_links):
+        try:
+            _cleanup_staged_volume(link_path, real_path, writable, is_directory, staged_ready)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            cleanup_errors.append(exc)
+
+    if len(cleanup_errors) == 1:
+        raise cleanup_errors[0]
+    if cleanup_errors:
+        raise RuntimeError(f"Failed to clean up {len(cleanup_errors)} staged volume(s)") from cleanup_errors[0]
+
+
+def _docker_autostart_enabled() -> bool:
+    """Windows-only: should we try to (re)start Docker Desktop on connection failure?
+
+    Docker Desktop on Windows silently stops itself (auto-pause, disk pressure,
+    WSL hiccups). A multi-hour RD-Agent loop then dies with "Docker is not
+    reachable" even though a retry a few seconds later would work. Set
+    ``RDAGENT_DOCKER_AUTOSTART=0`` to opt out.
+    """
+    if os.name != "nt":
+        return False
+    return os.environ.get("RDAGENT_DOCKER_AUTOSTART", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _start_docker_desktop() -> None:
+    """Best-effort `docker desktop start`, falling back to launching the GUI."""
+    candidates = [
+        [shutil.which("docker") or "docker", "desktop", "start"],
+    ]
+    gui = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Docker" / "Docker" / "Docker Desktop.exe"
+    for cmd in candidates:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180, check=False)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if proc.returncode == 0:
+            return
+        logger.warning(f"[docker] `{' '.join(cmd)}` exited {proc.returncode}: {(proc.stdout or proc.stderr).strip()[:200]}")
+        break
+    if gui.exists():
+        logger.info(f"[docker] launching {gui}")
+        with contextlib.suppress(OSError):
+            subprocess.Popen([str(gui)], close_fds=True)  # noqa: S603
+
+
+def get_docker_client(wait_seconds: int | None = None):  # type: ignore[no-untyped-def]
+    """`docker.from_env()` that survives Docker Desktop stopping itself on Windows.
+
+    Retries in a loop and, when enabled, asks Docker Desktop to start again.
+    Raises the original connection error with actionable advice if all fails.
+    """
+    if docker is None:
+        raise RuntimeError("Docker SDK is missing. Install the Docker backend dependencies to use DockerEnv.")
+    total_wait = wait_seconds if wait_seconds is not None else int(os.environ.get("RDAGENT_DOCKER_WAIT", "180"))
+    autostart = _docker_autostart_enabled()
+    deadline = time.time() + total_wait
+    started = False
+    last_exc: Exception | None = None
+    while True:
+        try:
+            return docker.from_env()
+        except Exception as exc:  # docker.errors.DockerException subclasses vary by version
+            last_exc = exc
+        if autostart and not started:
+            logger.warning("[docker] engine unreachable, attempting to start Docker Desktop")
+            _start_docker_desktop()
+            started = True
+        if time.time() >= deadline:
+            msg = (
+                "Docker is not reachable. Start Docker Desktop with its Linux engine enabled, then retry. "
+                f"(waited {total_wait}s)"
+            )
+            raise RuntimeError(msg) from last_exc
+        time.sleep(3)
+
+
 def pull_image_with_progress(image: str) -> None:
-    client = docker.APIClient(base_url="unix://var/run/docker.sock")
+    if docker is None:
+        raise RuntimeError("Docker SDK is missing. Install the Docker backend dependencies to use this scenario.")
+    client = get_docker_client().api
     pull_logs = client.pull(image, stream=True, decode=True)
     progress_bars = {}
 
@@ -190,7 +365,7 @@ class EnvConf(ExtendedBaseSettings):
         return [
             [str(path.relative_to(local_path)), path.read_text()]
             for path in sorted(
-                list(local_path.rglob("*.py")) + list(local_path.rglob("*.csv")) + list(local_path.rglob("*.yaml"))
+                list(local_path.rglob("*.py")) + list(local_path.rglob("*.csv")) + list(local_path.rglob("*.yaml")),
             )
         ]
 
@@ -220,7 +395,7 @@ class EnvResult:
     full_stdout: str
     exit_code: int
     running_time: float
-    stored_full_stdout_to_truncated_stdout: Dict[str, str]
+    stored_full_stdout_to_truncated_stdout: dict[str, str]
 
     def __init__(self, stdout: str, exit_code: int, running_time: float):
         self.full_stdout = stdout
@@ -275,7 +450,7 @@ class Env(Generic[ASpecificEnvConf]):
                     )
 
     def unzip_a_file_into_a_folder(
-        self, zip_file_path: str, folder_path: str, files_to_extract: list[str] | None = None
+        self, zip_file_path: str, folder_path: str, files_to_extract: list[str] | None = None,
     ) -> None:
         """
         Unzip a file into a folder, use zipfile instead of subprocess
@@ -341,7 +516,7 @@ class Env(Generic[ASpecificEnvConf]):
                 logger.info(f"Running time: {end - start} seconds")
                 if self.conf.running_timeout_period is not None and end - start + 1 >= self.conf.running_timeout_period:
                     logger.warning(
-                        f"The running time exceeds {self.conf.running_timeout_period} seconds, so the process is killed."
+                        f"The running time exceeds {self.conf.running_timeout_period} seconds, so the process is killed.",
                     )
                     log_output += f"\n\nThe running time exceeds {self.conf.running_timeout_period} seconds, so the process is killed."
                 return EnvResult(log_output, return_code, end - start)
@@ -349,7 +524,7 @@ class Env(Generic[ASpecificEnvConf]):
                 if retry_index == self.conf.retry_count:
                     raise
                 logger.warning(
-                    f"Error while running the container: {e}, current try index: {retry_index + 1}, {self.conf.retry_count - retry_index - 1} retries left."
+                    f"Error while running the container: {e}, current try index: {retry_index + 1}, {self.conf.retry_count - retry_index - 1} retries left.",
                 )
                 time.sleep(self.conf.retry_wait_seconds)
         raise RuntimeError  # for passing CI
@@ -423,24 +598,30 @@ class Env(Generic[ASpecificEnvConf]):
             log_file_relative_path = log_file.relative_to(Path(local_path))
             entry = f"{entry} > {log_file_relative_path} 2>&1"
 
-        if self.conf.running_timeout_period is None:
-            timeout_cmd = entry
+        # LocalEnv on Windows runs through cmd.exe, not the POSIX shell used by Docker
+        # and Unix LocalEnv. Apply the timeout in LocalEnv itself so commands remain
+        # native and no WSL/Git Bash installation is required for this backend.
+        if os.name == "nt" and isinstance(self.conf, LocalConf):
+            entry_add_timeout = entry
         else:
-            timeout_cmd = f"timeout --kill-after=10 {self.conf.running_timeout_period} {entry}"
-        entry_add_timeout = (
-            f"/bin/sh -c '"  # start of the sh command
-            + f"{timeout_cmd}; entry_exit_code=$?; "
-            + (
-                f"{_get_chmod_cmd(self.conf.mount_path)}; "
-                # We don't have to change the permission of the cache and input folder to remove it
-                # + f"if [ -d {self.conf.mount_path}/cache ]; then chmod 777 {self.conf.mount_path}/cache; fi; " +
-                #     f"if [ -d {self.conf.mount_path}/input ]; then chmod 777 {self.conf.mount_path}/input; fi; "
-                if isinstance(self.conf, DockerConf)
-                else ""
+            if self.conf.running_timeout_period is None:
+                timeout_cmd = entry
+            else:
+                timeout_cmd = f"timeout --kill-after=10 {self.conf.running_timeout_period} {entry}"
+            entry_add_timeout = (
+                "/bin/sh -c '"  # start of the sh command
+                 f"{timeout_cmd}; entry_exit_code=$?; "
+                + (
+                    f"{_get_chmod_cmd(self.conf.mount_path)}; "
+                    # We don't have to change the permission of the cache and input folder to remove it
+                    # + f"if [ -d {self.conf.mount_path}/cache ]; then chmod 777 {self.conf.mount_path}/cache; fi; " +
+                    #     f"if [ -d {self.conf.mount_path}/input ]; then chmod 777 {self.conf.mount_path}/input; fi; "
+                    if isinstance(self.conf, DockerConf)
+                    else ""
+                )
+                + "exit $entry_exit_code"
+                + "'"  # end of the sh command
             )
-            + "exit $entry_exit_code"
-            + "'"  # end of the sh command
-        )
 
         if self.conf.enable_cache:
             result = self.cached_run(
@@ -481,7 +662,7 @@ class Env(Generic[ASpecificEnvConf]):
         Will cache the output and the folder diff for next round of running.
         Use the python codes and the parameters(entry, running_extra_volume) as key to hash the input.
         """
-        target_folder = Path(RD_AGENT_SETTINGS.pickle_cache_folder_path_str) / f"utils.env.run"
+        target_folder = Path(RD_AGENT_SETTINGS.pickle_cache_folder_path_str) / "utils.env.run"
         target_folder.mkdir(parents=True, exist_ok=True)
 
         if cache_key_extra_func is not None:
@@ -492,7 +673,7 @@ class Env(Generic[ASpecificEnvConf]):
         key = md5_hash(
             json.dumps(cache_key_extra)
             + json.dumps({"entry": entry, "running_extra_volume": dict(running_extra_volume)})
-            + json.dumps({"extra_volumes": self.conf.extra_volumes})
+            + json.dumps({"extra_volumes": self.conf.extra_volumes}),
             # + json.dumps(data_key)
         )
         if Path(target_folder / f"{key}.pkl").exists() and Path(target_folder / f"{key}.zip").exists():
@@ -513,7 +694,7 @@ class Env(Generic[ASpecificEnvConf]):
             with open(target_folder / f"{key}.pkl", "wb") as f:
                 secure_pickle_dump(ret, f)
             self.zip_a_folder_into_a_file(local_path, str(target_folder / f"{key}.zip"))
-        return cast(EnvResult, ret)
+        return cast("EnvResult", ret)
 
     @abstractmethod
     def _run(
@@ -543,7 +724,6 @@ class Env(Generic[ASpecificEnvConf]):
         tuple[str, int]
             A tuple containing the standard output and the exit code.
         """
-        pass
 
     def dump_python_code_run_and_get_results(
         self,
@@ -552,7 +732,7 @@ class Env(Generic[ASpecificEnvConf]):
         local_path: str,
         env: dict | None = None,
         running_extra_volume: Mapping = MappingProxyType({}),
-        code_dump_file_py_name: Optional[str] = None,
+        code_dump_file_py_name: str | None = None,
     ) -> tuple[str, list]:
         """
         Dump the code into the local path and run the code.
@@ -579,7 +759,6 @@ class Env(Generic[ASpecificEnvConf]):
 
     def refresh_env(self) -> None:
         """Refresh the environment, e.g., pull the latest docker image. rebuild the conda env."""
-        pass
 
 
 # class EnvWithCache
@@ -618,11 +797,15 @@ class LocalEnv(Env[ASpecificLocalConf]):
         # Handle volume links
         volumes = {}
         if self.conf.extra_volumes is not None:
-            for lp, rp in self.conf.extra_volumes.items():
-                volumes[lp] = rp["bind"] if isinstance(rp, dict) else rp
-            cache_path = "/tmp/sample" if "/sample/" in "".join(self.conf.extra_volumes.keys()) else "/tmp/full"
-            Path(cache_path).mkdir(parents=True, exist_ok=True)
-            volumes[cache_path] = T("scenarios.data_science.share:scen.cache_path").r()
+            volumes.update(self.conf.extra_volumes)
+            is_sample = "/sample/" in "".join(self.conf.extra_volumes.keys())
+            cache_path = (
+                Path(tempfile.gettempdir()) / "rdagent" / ("sample" if is_sample else "full")
+                if os.name == "nt"
+                else Path("/tmp/sample" if is_sample else "/tmp/full")
+            )
+            cache_path.mkdir(parents=True, exist_ok=True)
+            volumes[str(cache_path)] = T("scenarios.data_science.share:scen.cache_path").r()
         for lp, rp in running_extra_volume.items():
             volumes[lp] = rp
 
@@ -630,26 +813,58 @@ class LocalEnv(Env[ASpecificLocalConf]):
         volumes = normalize_volumes(volumes, local_path)
 
         @contextlib.contextmanager
-        def _symlink_ctx(vol_map: Mapping[str, str]) -> Generator[None, None, None]:
-            created_links: list[Path] = []
+        def _symlink_ctx(vol_map: Mapping[str, str | dict[str, str]]) -> Generator[None, None, None]:
+            created_links: list[tuple[Path, Path, bool, bool, bool]] = []
             try:
-                for real, link in vol_map.items():
+                for real, volume_info in vol_map.items():
+                    if isinstance(volume_info, dict):
+                        link = volume_info["bind"]
+                        writable = volume_info.get("mode", "rw") != "ro"
+                    else:
+                        link = volume_info
+                        writable = True
                     link_path = Path(link)
                     real_path = Path(real)
-                    if not link_path.parent.exists():
-                        link_path.parent.mkdir(parents=True, exist_ok=True)
-                    if link_path.exists() or link_path.is_symlink():
-                        link_path.unlink()
-                    link_path.symlink_to(real_path)
-                    created_links.append(link_path)
+                    link_path.parent.mkdir(parents=True, exist_ok=True)
+                    _prepare_volume_target(link_path)
+                    if os.name == "nt":
+                        # Symlink creation commonly requires Developer Mode or admin rights.
+                        # Stage a private copy; only writable volumes are copied back.
+                        _reject_host_volume_symlinks(real_path)
+                        if not real_path.exists():
+                            if real_path.is_dir() or not real_path.suffix:
+                                real_path.mkdir(parents=True, exist_ok=True)
+                            else:
+                                real_path.parent.mkdir(parents=True, exist_ok=True)
+                                real_path.touch()
+                        is_directory = real_path.is_dir()
+                        staged_ready = False
+                        try:
+                            with tempfile.TemporaryDirectory(prefix="rdagent-volume-") as temp_dir:
+                                staged_path = Path(temp_dir) / "mount"
+                                if is_directory:
+                                    shutil.copytree(real_path, staged_path)
+                                else:
+                                    shutil.copy2(real_path, staged_path)
+                                shutil.move(str(staged_path), str(link_path))
+                            staged_ready = True
+                        finally:
+                            created_links.append((link_path, real_path, writable, is_directory, staged_ready))
+                    else:
+                        is_directory = real_path.is_dir()
+                        link_path.symlink_to(real_path, target_is_directory=is_directory)
+                        created_links.append((link_path, real_path, writable, is_directory, True))
                 yield
             finally:
-                for p in created_links:
-                    try:
-                        if p.is_symlink() or p.exists():
-                            p.unlink()
-                    except FileNotFoundError:
-                        pass
+                if os.name == "nt":
+                    _cleanup_staged_volumes(created_links)
+                else:
+                    for link_path, _, _, _, _ in reversed(created_links):
+                        try:
+                            if link_path.is_symlink():
+                                link_path.unlink()
+                        except FileNotFoundError:
+                            pass
 
         with _symlink_ctx(volumes):
             # Setup environment
@@ -660,13 +875,12 @@ class LocalEnv(Env[ASpecificLocalConf]):
             if "CUDA_VISIBLE_DEVICES" in os.environ and "CUDA_VISIBLE_DEVICES" not in env:
                 env["CUDA_VISIBLE_DEVICES"] = os.environ["CUDA_VISIBLE_DEVICES"]
 
-            path = [
-                *self.conf.bin_path.split(":"),
-                "/bin/",
-                "/usr/bin/",
-                *env.get("PATH", "").split(":"),
-            ]
-            env["PATH"] = ":".join(path)
+            inherited_path = env.get("PATH", os.environ.get("PATH", ""))
+            path = [part for part in self.conf.bin_path.split(os.pathsep) if part]
+            if os.name != "nt":
+                path.extend(["/bin/", "/usr/bin/"])
+            path.extend(part for part in inherited_path.split(os.pathsep) if part)
+            env["PATH"] = os.pathsep.join(path)
 
             if entry is None:
                 entry = self.conf.default_entry
@@ -684,68 +898,142 @@ class LocalEnv(Env[ASpecificLocalConf]):
             cwd = Path(local_path).resolve() if local_path else None
             env = {k: str(v) if isinstance(v, int) else v for k, v in env.items()}
 
-            process = subprocess.Popen(
-                entry,
-                cwd=cwd,
-                env={**os.environ, **env},
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                shell=True,
-                bufsize=1,
-                universal_newlines=True,
-            )
+            timed_out = False
+            if os.name == "nt":
+                command = entry
+                process = subprocess.Popen(
+                    command,
+                    cwd=cwd,
+                    env={**os.environ, **env},
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    shell=True,
+                    bufsize=1,
+                    universal_newlines=True,
+                )
+                if process.stdout is None or process.stderr is None:
+                    raise RuntimeError("The subprocess did not correctly create stdout/stderr pipes")
 
-            # Setup polling
-            if process.stdout is None or process.stderr is None:
-                raise RuntimeError("The subprocess did not correctly create stdout/stderr pipes")
+                output_queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
 
-            if self.conf.live_output:
-                stdout_fd = process.stdout.fileno()
-                stderr_fd = process.stderr.fileno()
+                def _read_stream(stream, label: str) -> None:
+                    try:
+                        for line in iter(stream.readline, ""):
+                            output_queue.put((label, line))
+                    finally:
+                        output_queue.put((label, None))
 
-                poller = select.poll()
-                poller.register(stdout_fd, select.POLLIN)
-                poller.register(stderr_fd, select.POLLIN)
+                readers = [
+                    threading.Thread(target=_read_stream, args=(process.stdout, "stdout"), daemon=True),
+                    threading.Thread(target=_read_stream, args=(process.stderr, "stderr"), daemon=True),
+                ]
+                for reader in readers:
+                    reader.start()
 
-                combined_output = ""
-                while True:
-                    if process.poll() is not None:
-                        break
-                    events = poller.poll(100)
-                    for fd, event in events:
-                        if event & select.POLLIN:
-                            if fd == stdout_fd:
-                                while True:
-                                    output = process.stdout.readline()
-                                    if output == "":
-                                        break
-                                    Console().print(output.strip(), markup=False)
-                                    combined_output += output
-                            elif fd == stderr_fd:
-                                while True:
-                                    error = process.stderr.readline()
-                                    if error == "":
-                                        break
-                                    Console().print(error.strip(), markup=False)
-                                    combined_output += error
+                output_parts: list[str] = []
+                closed_streams = 0
+                deadline = (
+                    time.monotonic() + self.conf.running_timeout_period
+                    if self.conf.running_timeout_period is not None
+                    else None
+                )
+                while closed_streams < len(readers):
+                    if deadline is not None and time.monotonic() >= deadline and process.poll() is None:
+                        timed_out = True
+                        subprocess.run(
+                            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            check=False,
+                        )
+                        if process.poll() is None:
+                            process.kill()
+                        output_parts.append(
+                            f"\nProcess exceeded timeout of {self.conf.running_timeout_period} seconds and was terminated.\n",
+                        )
+                        deadline = None
+                    try:
+                        label, chunk = output_queue.get(timeout=0.05)
+                    except queue.Empty:
+                        continue
+                    if chunk is None:
+                        closed_streams += 1
+                        continue
+                    output_parts.append(chunk)
+                    if self.conf.live_output:
+                        Console().print(chunk.rstrip("\r\n"), markup=False)
 
-                # Capture any final output
-                remaining_output, remaining_error = process.communicate()
-                if remaining_output:
-                    Console().print(remaining_output.strip(), markup=False)
-                    combined_output += remaining_output
-                if remaining_error:
-                    Console().print(remaining_error.strip(), markup=False)
-                    combined_output += remaining_error
+                process.wait()
+                process.stdout.close()
+                process.stderr.close()
+                return_code = 124 if timed_out else process.returncode
+                combined_output = "".join(output_parts)
+                if not self.conf.live_output:
+                    Console().print(combined_output, end="", markup=False)
             else:
-                # Sacrifice real-time output to avoid possible standard I/O hangs
-                out, err = process.communicate()
-                Console().print(out, end="", markup=False)
-                Console().print(err, end="", markup=False)
-                combined_output = out + err
+                process = subprocess.Popen(
+                    entry,
+                    cwd=cwd,
+                    env={**os.environ, **env},
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    shell=True,
+                    bufsize=1,
+                    universal_newlines=True,
+                )
 
-            return_code = process.returncode
+                # Setup polling
+                if process.stdout is None or process.stderr is None:
+                    raise RuntimeError("The subprocess did not correctly create stdout/stderr pipes")
+
+                if self.conf.live_output:
+                    stdout_fd = process.stdout.fileno()
+                    stderr_fd = process.stderr.fileno()
+
+                    poller = select.poll()
+                    poller.register(stdout_fd, select.POLLIN)
+                    poller.register(stderr_fd, select.POLLIN)
+
+                    combined_output = ""
+                    while True:
+                        if process.poll() is not None:
+                            break
+                        events = poller.poll(100)
+                        for fd, event in events:
+                            if event & select.POLLIN:
+                                if fd == stdout_fd:
+                                    while True:
+                                        output = process.stdout.readline()
+                                        if output == "":
+                                            break
+                                        Console().print(output.strip(), markup=False)
+                                        combined_output += output
+                                elif fd == stderr_fd:
+                                    while True:
+                                        error = process.stderr.readline()
+                                        if error == "":
+                                            break
+                                        Console().print(error.strip(), markup=False)
+                                        combined_output += error
+
+                    # Capture any final output
+                    remaining_output, remaining_error = process.communicate()
+                    if remaining_output:
+                        Console().print(remaining_output.strip(), markup=False)
+                        combined_output += remaining_output
+                    if remaining_error:
+                        Console().print(remaining_error.strip(), markup=False)
+                        combined_output += remaining_error
+                else:
+                    # Sacrifice real-time output to avoid possible standard I/O hangs
+                    out, err = process.communicate()
+                    Console().print(out, end="", markup=False)
+                    Console().print(err, end="", markup=False)
+                    combined_output = out + err
+
+                return_code = process.returncode
             print(Rule("[bold green]LocalEnv Logs End[/bold green]", style="dark_orange"))
 
             return combined_output, return_code
@@ -756,7 +1044,7 @@ class CondaConf(LocalConf):
     default_entry: str = "python main.py"
 
     @model_validator(mode="after")
-    def change_bin_path(self, **data: Any) -> "CondaConf":
+    def change_bin_path(self, **data: Any) -> CondaConf:
         self._update_bin_path()
         return self
 
@@ -766,13 +1054,27 @@ class CondaConf(LocalConf):
         This is called during initialization and can be called again after prepare()
         to ensure bin_path is set correctly even if the conda env was just created.
         """
-        conda_path_result = subprocess.run(
-            f"conda run -n {self.conda_env_name} --no-capture-output env | grep '^PATH='",
-            capture_output=True,
-            text=True,
-            shell=True,
-        )
-        self.bin_path = conda_path_result.stdout.strip().split("=")[1] if conda_path_result.returncode == 0 else ""
+        if os.name == "nt":
+            command = [
+                "conda",
+                "run",
+                "-n",
+                self.conda_env_name,
+                "--no-capture-output",
+                "python",
+                "-c",
+                "import os; print(os.environ['PATH'])",
+            ]
+            conda_path_result = subprocess.run(command, capture_output=True, text=True, check=False)
+            self.bin_path = conda_path_result.stdout.strip() if conda_path_result.returncode == 0 else self.bin_path
+        else:
+            conda_path_result = subprocess.run(
+                f"conda run -n {self.conda_env_name} --no-capture-output env | grep '^PATH='",
+                capture_output=True,
+                text=True,
+                shell=True,
+            )
+            self.bin_path = conda_path_result.stdout.strip().split("=")[1] if conda_path_result.returncode == 0 else ""
 
 
 class MLECondaConf(CondaConf):
@@ -782,7 +1084,7 @@ class MLECondaConf(CondaConf):
 ## Docker Environment -----
 class DockerConf(EnvConf):
     build_from_dockerfile: bool = False
-    dockerfile_folder_path: Optional[Path] = (
+    dockerfile_folder_path: Path | None = (
         None  # the path to the dockerfile optional path provided when build_from_dockerfile is False
     )
     image: str  # the image you want to build
@@ -824,7 +1126,7 @@ class DockerConf(EnvConf):
     terminal_tail_lines: int = 20
 
     @model_validator(mode="after")
-    def populate_exclude_chmod_paths(self) -> "DockerConf":
+    def populate_exclude_chmod_paths(self) -> DockerConf:
         """
         Automatically populate exclude_chmod_paths from share.yaml configuration.
 
@@ -838,7 +1140,7 @@ class DockerConf(EnvConf):
                 for key in self._exclude_path_keys
                 if (
                     name := extract_dir_name_from_path_config(
-                        T(f"scenarios.{self._scenario_name}.share:scen.{key}").r()
+                        T(f"scenarios.{self._scenario_name}.share:scen.{key}").r(),
                     )
                 )
             ]
@@ -1054,7 +1356,7 @@ class QlibDockerConf(DockerConf):
         str(Path("~/.qlib/").expanduser().resolve().absolute()): {
             "bind": "/root/.qlib/",
             "mode": "rw",
-        }
+        },
     }
     shm_size: str | None = "16g"
     enable_gpu: bool = True
@@ -1196,7 +1498,9 @@ class DockerEnv(Env[DockerConf]):
         """
         Download image if it doesn't exist
         """
-        client = docker.from_env()
+        if docker is None:
+            raise RuntimeError("Docker SDK is missing. Install the Docker backend dependencies to use DockerEnv.")
+        client = get_docker_client()
         if (
             self.conf.build_from_dockerfile
             and self.conf.dockerfile_folder_path is not None
@@ -1210,67 +1514,54 @@ class DockerEnv(Env[DockerConf]):
             )
             if isinstance(resp_stream, str):
                 logger.info(resp_stream)
-            with Progress(SpinnerColumn(), TextColumn("{task.description}")) as p:
-                task = p.add_task("[cyan]Building image...")
-                for part in resp_stream:
-                    lines = part.decode("utf-8").split("\r\n")
-                    for line in lines:
-                        if line.strip():
-                            status_dict = json.loads(line)
-                            if "error" in status_dict:
-                                p.update(
-                                    task,
-                                    description=f"[red]error: {status_dict['error']}",
-                                )
-                                raise docker.errors.BuildError(status_dict["error"], "")
-                            if "stream" in status_dict:
-                                p.update(task, description=status_dict["stream"])
+            # NOTE: deliberately no rich Progress bar here. On legacy Windows consoles
+            # (cp1252) rich's spinner characters raise
+            # `UnicodeEncodeError: 'charmap' codec can't encode character '\u2839'`
+            # while unwinding, which masks the real build error. Plain logging is portable.
+            last_reported = ""
+            for part in resp_stream:
+                lines = part.decode("utf-8", errors="replace").split("\r\n")
+                for line in lines:
+                    if not line.strip():
+                        continue
+                    try:
+                        status_dict = json.loads(line)
+                    except json.JSONDecodeError:
+                        logger.debug(f"[docker build] {line}")
+                        continue
+                    if "error" in status_dict:
+                        raise RuntimeError(f"Docker build failed: {status_dict['error']}")
+                    if "stream" in status_dict:
+                        text = str(status_dict["stream"]).strip()
+                        if text and text != last_reported:
+                            last_reported = text
+                            logger.info(f"[docker build] {text}")
             logger.info(f"Finished building the image from dockerfile: {self.conf.dockerfile_folder_path}")
         try:
             client.images.get(self.conf.image)
         except docker.errors.ImageNotFound:
             image_pull = client.api.pull(self.conf.image, stream=True, decode=True)
-            current_status = ""
             layer_set = set()
             completed_layers = 0
-            with Progress(TextColumn("{task.description}"), TextColumn("{task.fields[progress]}")) as sp:
-                main_task = sp.add_task("[cyan]Pulling image...", progress="")
-                status_task = sp.add_task("[bright_magenta]layer status", progress="")
-                for line in image_pull:
-                    if "error" in line:
-                        sp.update(
-                            status_task,
-                            description=f"[red]error",
-                            progress=line["error"],
-                        )
-                        raise docker.errors.APIError(line["error"])
+            # Plain logging instead of a rich Progress bar: see the note above about
+            # cp1252 consoles raising UnicodeEncodeError on rich spinner glyphs.
+            for line in image_pull:
+                if "error" in line:
+                    raise RuntimeError(f"Error while pulling image: {line['error']}")
 
-                    layer_id = line["id"]
-                    status = line["status"]
-                    p_text = line.get("progress", None)
+                layer_id = line.get("id", "")
+                status = line.get("status", "")
 
-                    if layer_id not in layer_set:
-                        layer_set.add(layer_id)
-
-                    if p_text:
-                        current_status = p_text
-
-                    if status == "Pull complete" or status == "Already exists":
-                        completed_layers += 1
-
-                    sp.update(
-                        main_task,
-                        progress=f"[green]{completed_layers}[white]/{len(layer_set)} layers completed",
-                    )
-                    sp.update(
-                        status_task,
-                        description=f"[bright_magenta]layer {layer_id} [yellow]{status}",
-                        progress=current_status,
-                    )
+                if layer_id not in layer_set:
+                    layer_set.add(layer_id)
+                    logger.info(f"[docker pull] layer {layer_id} {status}")
+                elif status in ("Pull complete", "Already exists"):
+                    completed_layers += 1
+                    logger.info(f"[docker pull] {completed_layers}/{len(layer_set)} layers completed")
         except docker.errors.APIError as e:
             raise RuntimeError(f"Error while pulling the image: {e}")
 
-    def _gpu_kwargs(self, client: docker.DockerClient) -> dict:  # type: ignore[no-any-unimported]
+    def _gpu_kwargs(self, client: Any) -> dict:
         """get gpu kwargs based on its availability.
 
         Supports GPU selection via CUDA_VISIBLE_DEVICES environment variable.
@@ -1330,7 +1621,7 @@ class DockerEnv(Env[DockerConf]):
         """
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         header = "=" * 80 + "\n"
-        header += f"Docker Execution Log\n"
+        header += "Docker Execution Log\n"
         header += f"Timestamp: {timestamp}\n"
         header += f"Image: {self.conf.image}\n"
         if entry:
@@ -1385,7 +1676,7 @@ class DockerEnv(Env[DockerConf]):
         # Process logs with tail mode
         if use_tail_mode:
 
-            log_buffer: Deque[str] = deque(maxlen=self.conf.terminal_tail_lines)
+            log_buffer: deque[str] = deque(maxlen=self.conf.terminal_tail_lines)
 
             def format_tail_display() -> Text:
                 text = Text()
@@ -1455,7 +1746,7 @@ class DockerEnv(Env[DockerConf]):
         env["TF_CPP_MIN_LOG_LEVEL"] = "2"
         env["PYTHONUNBUFFERED"] = "1"
         env["TOKENIZERS_PARALLELISM"] = "false"  # Avoid tokenizer fork warning in multi-process training
-        client = docker.from_env()
+        client = get_docker_client()
 
         volumes = {}
         if local_path is not None:
@@ -1466,6 +1757,10 @@ class DockerEnv(Env[DockerConf]):
             for lp, rp in self.conf.extra_volumes.items():
                 volumes[lp] = rp if isinstance(rp, dict) else {"bind": rp, "mode": self.conf.extra_volume_mode}
             cache_path = "/tmp/sample" if "/sample/" in "".join(self.conf.extra_volumes.keys()) else "/tmp/full"
+            if os.name == "nt":
+                # Windows has no /tmp; a POSIX-looking host path would be passed straight
+                # through to the daemon and rejected ("too many colons").
+                cache_path = os.path.join(tempfile.gettempdir(), "rdagent", Path(cache_path).name)
             Path(cache_path).mkdir(parents=True, exist_ok=True)
             volumes[cache_path] = {
                 "bind": T("scenarios.data_science.share:scen.cache_path").r(),
@@ -1474,10 +1769,10 @@ class DockerEnv(Env[DockerConf]):
         for lp, rp in running_extra_volume.items():
             volumes[lp] = rp if isinstance(rp, dict) else {"bind": rp, "mode": self.conf.extra_volume_mode}
 
-        volumes = normalize_volumes(cast(dict[str, str | dict[str, str]], volumes), self.conf.mount_path)
+        volumes = normalize_volumes(cast("dict[str, str | dict[str, str]]", volumes), self.conf.mount_path)
 
         log_output = ""
-        container: docker.models.containers.Container | None = None  # type: ignore[no-any-unimported]
+        container: Any | None = None
 
         try:
             container = client.containers.run(
@@ -1525,7 +1820,7 @@ class DockerEnv(Env[DockerConf]):
 
     def refresh_env(self) -> None:
         """Remove the Docker image associated with this environment."""
-        client = docker.from_env()
+        client = get_docker_client()
         try:
             # Remove the specific image
             client.images.remove(image=self.conf.image, force=True)

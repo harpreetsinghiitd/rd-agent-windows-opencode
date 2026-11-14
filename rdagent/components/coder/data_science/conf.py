@@ -1,3 +1,4 @@
+import os
 from typing import Literal
 
 from rdagent.app.data_science.conf import DS_RD_SETTING
@@ -7,6 +8,7 @@ from rdagent.utils.env import (
     DockerEnv,
     DSDockerConf,
     Env,
+    LocalConf,
     LocalEnv,
     MLEBDockerConf,
     MLECondaConf,
@@ -43,6 +45,7 @@ def get_ds_env(
     extra_volumes: dict = {},
     running_timeout_period: int | None = DS_RD_SETTING.debug_timeout,
     enable_cache: bool | None = None,
+    env_type: str | None = None,
 ) -> Env:
     """
     Retrieve the appropriate environment configuration based on the env_type setting.
@@ -54,19 +57,23 @@ def get_ds_env(
         ValueError: If the env_type is not recognized.
     """
     conf = DSCoderCoSTEERSettings()
-    assert conf_type in ["kaggle", "mlebench"], f"Unknown conf_type: {conf_type}"
+    if conf_type not in ("kaggle", "mlebench"):
+        raise ValueError(f"Unknown conf_type: {conf_type}")
+    selected_env_type = env_type or conf.env_type
 
-    if conf.env_type == "docker":
+    if selected_env_type == "docker":
         env_conf = DSDockerConf() if conf_type == "kaggle" else MLEBDockerConf()
         env = DockerEnv(conf=env_conf)
-    elif conf.env_type == "conda":
+    elif selected_env_type == "conda":
         env = LocalEnv(
             conf=(
                 CondaConf(conda_env_name=conf_type) if conf_type == "kaggle" else MLECondaConf(conda_env_name=conf_type)
-            )
+            ),
         )
+    elif selected_env_type == "local":
+        env = LocalEnv(conf=LocalConf(default_entry="python main.py"))
     else:
-        raise ValueError(f"Unknown env type: {conf.env_type}")
+        raise ValueError(f"Unknown env type: {selected_env_type}")
     env.conf.extra_volumes = extra_volumes.copy()
     env.conf.running_timeout_period = running_timeout_period
     if enable_cache is not None:
@@ -80,8 +87,15 @@ def get_clear_ws_cmd(stage: Literal["before_training", "before_inference"] = "be
     Clean the files in workspace to a specific stage
     """
     assert stage in ["before_training", "before_inference"], f"Unknown stage: {stage}"
+    targets = ["submission.csv", "scores.csv", "trace.log"]
     if DS_RD_SETTING.enable_model_dump and stage == "before_training":
-        cmd = "rm -r submission.csv scores.csv models trace.log"
-    else:
-        cmd = "rm submission.csv scores.csv trace.log"
-    return cmd
+        targets.append("models")
+    if os.name == "nt":
+        # Execute a Python cleanup snippet: `rm` is not part of stock Windows.
+        # No single quotes: Docker envs wrap the entry in `sh -c '...'`.
+        return (
+            'python -c "import sys, shutil; from pathlib import Path; '
+            "[shutil.rmtree(p) if Path(p).is_dir() else Path(p).unlink(missing_ok=True) "
+            'for p in sys.argv[1:]]" ' + " ".join(targets)
+        )
+    return "rm " + ("-r " if "models" in targets else "") + " ".join(targets)

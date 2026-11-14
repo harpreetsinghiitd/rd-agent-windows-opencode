@@ -8,7 +8,6 @@ from typing import Generator
 
 from loguru import logger
 from psutil import Process
-
 from rdagent.core.utils import SingletonBaseClass, import_class
 
 from .base import Storage
@@ -44,8 +43,41 @@ class RDAgentLog(SingletonBaseClass):
     _tag_ctx: ContextVar[str] = ContextVar("_tag_ctx", default="")
     _raw_log_key = "_rdagent_raw"
 
+    @staticmethod
+    def _make_console_streams_encoding_safe() -> None:
+        """Keep legacy Windows console encodings (cp1252/cp437) from aborting a run.
+
+        Log messages, Rich output and user scripts all print characters such as
+        ``→`` (U+2192) or ``✓``. On a non-UTF-8 console those writes raise
+        ``UnicodeEncodeError: 'charmap' codec can't encode character '\\u2192'``,
+        which kills the whole loop (and, when it happens inside a loguru sink,
+        replaces the real error with an encoding error). Reconfiguring the
+        streams to ``errors="replace"`` keeps the run alive and only degrades
+        the offending glyph to ``?``.
+        """
+        for stream in (sys.stdout, sys.stderr):
+            # colorama (and some other shims) replace sys.stdout with a wrapper
+            # whose real sink hangs off `.wrapped` / `.stream`; reconfigure that.
+            target = stream
+            for _ in range(4):
+                nxt = getattr(target, "wrapped", None) or getattr(target, "stream", None)
+                if nxt is None or nxt is target:
+                    break
+                target = nxt
+            reconfigure = getattr(target, "reconfigure", None)
+            if reconfigure is None:  # pytest capture, StringIO, Jupyter, ...
+                continue
+            encoding = (getattr(target, "encoding", "") or "").replace("-", "").replace("_", "").lower()
+            if encoding.startswith("utf"):
+                continue
+            try:
+                reconfigure(errors="replace")
+            except (ValueError, OSError):
+                pass
+
     @classmethod
     def _configure_console_sinks(cls) -> None:
+        cls._make_console_streams_encoding_safe()
         raw_filter = lambda record: bool(record["extra"].get(cls._raw_log_key, False))
         normal_filter = lambda record: not raw_filter(record)
 

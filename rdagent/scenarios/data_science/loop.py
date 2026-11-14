@@ -1,9 +1,8 @@
-import asyncio
 import shutil
-import subprocess
+import tarfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any
 
 from rdagent.app.data_science.conf import DS_RD_SETTING
 from rdagent.components.coder.data_science.ensemble import EnsembleCoSTEER
@@ -27,16 +26,12 @@ from rdagent.core.proposal import ExperimentFeedback, ExpGen
 from rdagent.core.scenario import Scenario
 from rdagent.core.utils import import_class
 from rdagent.log import rdagent_logger as logger
-from rdagent.scenarios.data_science.dev.feedback import DSExperiment2Feedback
 from rdagent.scenarios.data_science.dev.runner import DSCoSTEERRunner
 from rdagent.scenarios.data_science.experiment.experiment import DSExperiment
 from rdagent.scenarios.data_science.proposal.exp_gen import DSTrace
 from rdagent.scenarios.data_science.proposal.exp_gen.base import DataScienceScen
 from rdagent.scenarios.data_science.proposal.exp_gen.idea_pool import DSKnowledgeBase
 from rdagent.scenarios.data_science.proposal.exp_gen.proposal import DSProposalV2ExpGen
-from rdagent.scenarios.data_science.proposal.exp_gen.trace_scheduler import (
-    MCTSScheduler,
-)
 from rdagent.utils.workflow.misc import wait_retry
 
 
@@ -68,18 +63,11 @@ def backup_folder(path: str | Path) -> Path:
         shutil.rmtree(workspace_bak_path)
 
     try:
-        # `cp` may raise error if the workspace is beiing modified.
-        # rsync is more robust choice, but it is not installed in some docker images.
-        # use shutil.copytree(..., symlinks=True) should be more elegant, but it has more changes to raise error.
-        subprocess.run(
-            ["cp", "-r", "-P", str(path), str(workspace_bak_path)],
-            check=True,
-            capture_output=True,
-        )
-    except subprocess.CalledProcessError as e:
+        # Copy with Python so the data-science loop does not depend on GNU cp (unavailable
+        # on stock Windows). Preserve symlinks as `cp -P` did on the Linux implementation.
+        shutil.copytree(path, workspace_bak_path, symlinks=True)
+    except OSError as e:
         logger.error(f"Error copying {path} to {workspace_bak_path}: {e}")
-        logger.error(f"Stdout: {e.stdout.decode() if e.stdout else ''}")
-        logger.error(f"Stderr: {e.stderr.decode() if e.stderr else ''}")
         raise
     return workspace_bak_path
 
@@ -126,7 +114,7 @@ class DataScienceRDLoop(RDLoop):
 
         if DS_RD_SETTING.enable_knowledge_base and DS_RD_SETTING.knowledge_base_version == "v1":
             knowledge_base = DSKnowledgeBase(
-                path=DS_RD_SETTING.knowledge_base_path, idea_pool_json_path=DS_RD_SETTING.idea_pool_json_path
+                path=DS_RD_SETTING.knowledge_base_path, idea_pool_json_path=DS_RD_SETTING.idea_pool_json_path,
             )
             self.trace = DSTrace(scen=scen, knowledge_base=knowledge_base)
         else:
@@ -214,7 +202,7 @@ class DataScienceRDLoop(RDLoop):
 
         cur_loop_id = prev_out[self.LOOP_IDX_KEY]
 
-        e = prev_out.get(self.EXCEPTION_KEY, None)
+        e = prev_out.get(self.EXCEPTION_KEY)
         if e is None:
             exp = prev_out["running"]
 
@@ -235,7 +223,7 @@ class DataScienceRDLoop(RDLoop):
                 and e.caused_by_timeout
             ):
                 logger.info(
-                    f"Timeout error occurred: {e}. Increasing timeout for the current scenario from {self.trace.scen.timeout_increase_count} to {self.trace.scen.timeout_increase_count + 1}."
+                    f"Timeout error occurred: {e}. Increasing timeout for the current scenario from {self.trace.scen.timeout_increase_count} to {self.trace.scen.timeout_increase_count + 1}.",
                 )
                 self.trace.scen.increase_timeout()
 
@@ -261,7 +249,7 @@ class DataScienceRDLoop(RDLoop):
                             new_scen = self.trace.scen
                             if hasattr(new_scen, "reanalyze_competition_description"):
                                 logger.info(
-                                    "Reanalyzing the competition description after three consecutive coding failures."
+                                    "Reanalyzing the competition description after three consecutive coding failures.",
                                 )
                                 new_scen.reanalyze_competition_description()
                                 self.trace.scen = new_scen
@@ -300,22 +288,19 @@ class DataScienceRDLoop(RDLoop):
             logger.info(f"Archiving log and workspace folder after loop {self.loop_idx}")
             mid_log_tar_path = (
                 Path(
-                    DS_RD_SETTING.log_archive_temp_path
-                    if DS_RD_SETTING.log_archive_temp_path
-                    else DS_RD_SETTING.log_archive_path
+                    DS_RD_SETTING.log_archive_temp_path or DS_RD_SETTING.log_archive_path,
                 )
                 / "mid_log.tar"
             )
             mid_workspace_tar_path = (
                 Path(
-                    DS_RD_SETTING.log_archive_temp_path
-                    if DS_RD_SETTING.log_archive_temp_path
-                    else DS_RD_SETTING.log_archive_path
+                    DS_RD_SETTING.log_archive_temp_path or DS_RD_SETTING.log_archive_path,
                 )
                 / "mid_workspace.tar"
             )
             log_back_path = backup_folder(Path().cwd() / "log")
-            subprocess.run(["tar", "-cf", str(mid_log_tar_path), "-C", str(log_back_path), "."], check=True)
+            with tarfile.open(mid_log_tar_path, "w") as archive:
+                archive.add(log_back_path, arcname=".")
 
             # only clean current workspace without affecting other loops.
             for k in "direct_exp_gen", "coding", "running":
@@ -332,7 +317,8 @@ class DataScienceRDLoop(RDLoop):
                 clean_workspace(bak_workspace)
 
             # - Step 3: Create tarball from the cleaned .bak workspace
-            subprocess.run(["tar", "-cf", str(mid_workspace_tar_path), "-C", str(workspace_bak_path), "."], check=True)
+            with tarfile.open(mid_workspace_tar_path, "w") as archive:
+                archive.add(workspace_bak_path, arcname=".")
 
             # - Step 4: Remove .bak package
             shutil.rmtree(workspace_bak_path)
@@ -343,14 +329,14 @@ class DataScienceRDLoop(RDLoop):
                 shutil.move(mid_workspace_tar_path, Path(DS_RD_SETTING.log_archive_path) / "mid_workspace.tar")
                 mid_workspace_tar_path = Path(DS_RD_SETTING.log_archive_path) / "mid_workspace.tar"
             shutil.copy(
-                mid_log_tar_path, Path(DS_RD_SETTING.log_archive_path) / "mid_log_bak.tar"
+                mid_log_tar_path, Path(DS_RD_SETTING.log_archive_path) / "mid_log_bak.tar",
             )  # backup when upper code line is killed when running
             shutil.copy(
-                mid_workspace_tar_path, Path(DS_RD_SETTING.log_archive_path) / "mid_workspace_bak.tar"
+                mid_workspace_tar_path, Path(DS_RD_SETTING.log_archive_path) / "mid_workspace_bak.tar",
             )  # backup when upper code line is killed when running
             self.timer.add_duration(datetime.now() - start_archive_datetime)
 
-    def _check_exit_conditions_on_step(self, loop_id: Optional[int] = None, step_id: Optional[int] = None):
+    def _check_exit_conditions_on_step(self, loop_id: int | None = None, step_id: int | None = None):
         if step_id not in [self.steps.index("running"), self.steps.index("feedback")]:
             # pass the check for running and feedbacks since they are very likely to be finished soon.
             super()._check_exit_conditions_on_step(loop_id=loop_id, step_id=step_id)
@@ -366,7 +352,7 @@ class DataScienceRDLoop(RDLoop):
         logger.log_object(DS_RD_SETTING.competition, tag="competition")  # NOTE: necessary to make mle_summary work.
         if DS_RD_SETTING.enable_knowledge_base and DS_RD_SETTING.knowledge_base_version == "v1":
             session.trace.knowledge_base = DSKnowledgeBase(
-                path=DS_RD_SETTING.knowledge_base_path, idea_pool_json_path=DS_RD_SETTING.idea_pool_json_path
+                path=DS_RD_SETTING.knowledge_base_path, idea_pool_json_path=DS_RD_SETTING.idea_pool_json_path,
             )
         return session
 
