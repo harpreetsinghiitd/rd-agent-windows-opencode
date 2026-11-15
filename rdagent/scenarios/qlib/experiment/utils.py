@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pandas as pd
 from jinja2 import Environment, StrictUndefined
-
 from rdagent.components.coder.factor_coder.config import FACTOR_COSTEER_SETTINGS
 from rdagent.utils.env import QTDockerEnv
 
@@ -18,7 +17,7 @@ def generate_data_folder_from_qlib():
     # Run the Qlib backtest
     execute_log = qtde.check_output(
         local_path=str(template_path),
-        entry=f"python generate.py",
+        entry="python generate.py",
     )
 
     assert (Path(__file__).parent / "factor_data_template" / "daily_pv_all.h5").exists(), (
@@ -146,6 +145,11 @@ def get_file_desc(p: Path, variable_list=[]) -> str:
 
 def get_data_folder_intro(fname_reg: str = ".*", flags=0, variable_mapping=None) -> str:
     """
+    Describe explicitly provided factor data folders for the scenario prompt.
+
+    Factor data is never downloaded or generated implicitly. Provide compatible
+    prebuilt HDF5 source data in both configured folders.
+
     Directly get the info of the data folder.
     It is for preparing prompting message.
 
@@ -163,15 +167,29 @@ def get_data_folder_intro(fname_reg: str = ".*", flags=0, variable_mapping=None)
             The description of the data folder.
     """
 
-    if (
-        not Path(FACTOR_COSTEER_SETTINGS.data_folder).exists()
-        or not Path(FACTOR_COSTEER_SETTINGS.data_folder_debug).exists()
-    ):
-        # FIXME: (xiao) I think this is writing in a hard-coded way.
-        # get data folder intro does not imply that we are generating the data folder.
-        generate_data_folder_from_qlib()
+    source_folders = {
+        "FACTOR_COSTEER_DATA_FOLDER": Path(FACTOR_COSTEER_SETTINGS.data_folder),
+        "FACTOR_COSTEER_DATA_FOLDER_DEBUG": Path(FACTOR_COSTEER_SETTINGS.data_folder_debug),
+    }
+    missing = [f"{env_name}={path}" for env_name, path in source_folders.items() if not path.is_dir()]
+    if missing:
+        raise FileNotFoundError(
+            "Qlib factor source data is not configured. Provide prebuilt HDF5 data in both folders "
+            "(" + ", ".join(missing) + "). No data is downloaded or generated automatically."
+        )
+
+    debug_files = [p for p in source_folders["FACTOR_COSTEER_DATA_FOLDER_DEBUG"].iterdir() if p.is_file()]
+    source_files = [p for p in source_folders["FACTOR_COSTEER_DATA_FOLDER"].iterdir() if p.is_file()]
+    has_source_hdf = any(p.suffix.lower() == ".h5" for p in source_files)
+    has_debug_hdf = any(p.suffix.lower() == ".h5" for p in debug_files)
+    if not has_source_hdf or not has_debug_hdf:
+        raise FileNotFoundError(
+            "Qlib factor source data folders must both contain prebuilt .h5 files. Configure "
+            "FACTOR_COSTEER_DATA_FOLDER and FACTOR_COSTEER_DATA_FOLDER_DEBUG with HDF5 data."
+        )
+
     content_l = []
-    for p in Path(FACTOR_COSTEER_SETTINGS.data_folder_debug).iterdir():
+    for p in debug_files:
         if re.match(fname_reg, p.name, flags) is not None:
             if variable_mapping:
                 content_l.append(get_file_desc(p, variable_mapping.get(p.stem, [])))

@@ -1,0 +1,66 @@
+RD-AGENT + OPENCODE ON WINDOWS — QUICK START
+
+This file answers two questions:
+1. Where do I type a research prompt?
+2. What is the RD-Agent UI for?
+
+WHERE TO TYPE THE PROMPT
+
+Use the OpenCode chat, not the RD-Agent browser UI:
+
+1. Open the RD-Agent folder in OpenCode:
+   C:\Users\HP\Downloads\RD-Agent
+2. Make sure OpenCode is signed in to the provider/model you want to use, and Docker Desktop is running with its Linux engine.
+3. In the OpenCode chat message box, type /rdagent and then describe your task. Example:
+
+   /rdagent Help me explore this non-sensitive tabular dataset. The target column is "outcome"; use the files in <dataset-folder>. First inspect the schema, propose a safe experiment plan, and ask me before any expensive or destructive action. Use Docker for generated code.
+
+   Replace <dataset-folder> and the target with your own details. Do not paste passwords, API keys, personal information, medical records, or other sensitive data. Prompts and data previews sent through RD-Agent may be processed by the provider selected in OpenCode.
+
+The /rdagent command is OpenCode guidance for working with this checkout; it is not itself a separate RD-Agent prompt webpage. You type your task in the OpenCode chat alongside the command. The model/provider is configured in the local .env file. To see the current selection, run this from PowerShell in the repository:
+
+   python -m rdagent.oai.backend.opencode current
+
+To list available OpenCode models:
+
+   python -m rdagent.oai.backend.opencode list-models
+
+WHAT THE RD-AGENT WEB UI DOES
+
+The standard UI is mainly for viewing run logs/traces; it is not a general-purpose box for starting a new research task. Start it in PowerShell from the repository with:
+
+   python -m rdagent.app.cli ui
+
+The browser UI uses the local Streamlit server (default address is http://localhost:19899). The `ui` command also accepts `--port` to choose another port, `--log-dir` to display a specific log folder, `--debug` for debug display, and `--data-science` for the data-science log view. Example:
+
+   python -m rdagent.app.cli ui --port 19899 --log-dir <trusted-log-folder>
+
+Use OpenCode chat or the CLI to start work; use this UI to inspect run information. It is not where you enter the initial research prompt. Only open log folders you trust, because logs may contain generated content.
+
+There is also a data-science user-interaction page:
+
+   python -m rdagent.app.cli ds_user_interact
+
+That page is for responding to a pending question from a running data-science workflow (for example, reviewing a proposed task or hypothesis). It does not start a new task. It may show nothing unless a workflow has requested input. Its default address is http://localhost:19900; choose another port with `--port` if needed.
+
+RUNNING A BOUNDED SYNTHETIC EXAMPLE FROM POWERSHELL
+
+The following command was previously exercised with the small synthetic, non-clinical fixture included in this local setup:
+
+   python -m rdagent.app.cli data_science --competition rdagent-windows-synthetic-tabular --step-n 1 --loop-n 1 --timeout 3m
+
+This starts a run; it may use your selected model and Docker. It is a small integration check, not a full research run. The test reached proposal/code generation, Docker execution, evaluation, and artifact writing, then stopped at its configured step limit. Its toy-data score is not evidence of real-world model quality. Do not omit --competition: the CLI otherwise has a different default dataset/task.
+
+For your own dataset, first inspect the DataScience scenario/configuration and arrange the files in the format it expects. Do not assume that an arbitrary folder or competition name will work. Keep generated code in Docker. The local execution backend runs code with your Windows-user permissions and is not sandboxed.
+
+LIMITS / SAFETY
+
+- Windows support is a locally tested port, not a claim of complete upstream support; upstream documents Linux-only support.
+- The full RD-Agent data-science loop was not verified end-to-end. 175 bounded regression tests passed, with 2 skipped; that does not mean every workflow is supported.
+- Never run the ARF/Medical scenario for this setup; it contains clinical data and is outside scope.
+- WIC/finance support is not complete. The Qlib path is primarily China-equity-oriented and does not provide an options-chain backtester, options pricing/fills, or an Interactive Brokers order adapter. No WIC strategy or NVDA/US-market backtest has been validated.
+- Qlib setup no longer downloads China market data implicitly. Provide compatible local Qlib data explicitly; legacy China data download is available only with `QLIB_DOCKER_AUTO_DOWNLOAD_CN_DATA=True`. Factor/quant scenarios require compatible prebuilt factor `.h5` files in `FACTOR_COSTEER_DATA_FOLDER` and `FACTOR_COSTEER_DATA_FOLDER_DEBUG`; they no longer generate all-market data during scenario startup.
+- WIC Trader research/decision support and AI Agent autonomous trading have different rules. Do not connect a live TWS account, submit orders, or use the OpenCode provider for WIC live AI decisions. The AI Agent division requires the organizer-approved LLM route and a declared/frozen model/tool setup; these details and usable historical options data are not configured here.
+- Keep .env, datasets, logs, and generated artifacts private and out of commits.
+
+The integration changes are committed locally as 98924a8. They have not been pushed to GitHub.

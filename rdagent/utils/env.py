@@ -1347,6 +1347,9 @@ class QlibDockerConf(DockerConf):
         env_parse_none_str="None",  # Nthis is the key to accept `RUNNING_TIMEOUT_PERIOD=None`
     )
 
+    auto_download_cn_data: bool = False
+    """Allow QTDockerEnv.prepare() to fetch the legacy CN provider explicitly."""
+
     build_from_dockerfile: bool = True
     dockerfile_folder_path: Path = Path(__file__).parent.parent / "scenarios" / "qlib" / "docker"
     image: str = "local_qlib:latest"
@@ -1843,17 +1846,28 @@ class QTDockerEnv(DockerEnv):
         super().__init__(conf)
 
     def prepare(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
-        """
-        Download image & data if it doesn't exist
-        """
+        """Prepare the image; legacy CN data downloads require explicit opt-in."""
         super().prepare()
-        qlib_data_path = next(iter(self.conf.extra_volumes.keys()))
+        if not getattr(self.conf, "auto_download_cn_data", False):
+            logger.info(
+                "Automatic Qlib CN data download is disabled. Configure a local Qlib provider "
+                "and mount it through QLIB_DOCKER_EXTRA_VOLUMES, or explicitly set "
+                "QLIB_DOCKER_AUTO_DOWNLOAD_CN_DATA=True for the legacy CN downloader."
+            )
+            return
+
+        qlib_data_path = next(iter(self.conf.extra_volumes.keys()), None)
+        if qlib_data_path is None:
+            raise ValueError("Cannot download Qlib CN data: QLIB_DOCKER_EXTRA_VOLUMES has no host mount.")
         if not (Path(qlib_data_path) / "qlib_data" / "cn_data").exists():
-            logger.info("We are downloading!")
-            cmd = "python -m qlib.run.get_data qlib_data --target_dir ~/.qlib/qlib_data/cn_data --region cn --interval 1d --delete_old False"
+            logger.info("Downloading legacy Qlib CN data because auto_download_cn_data=True.")
+            cmd = (
+                "python -m qlib.run.get_data qlib_data --target_dir ~/.qlib/qlib_data/cn_data "
+                "--region cn --interval 1d --delete_old False"
+            )
             self.check_output(entry=cmd)
         else:
-            logger.info("Data already exists. Download skipped.")
+            logger.info("Qlib CN data already exists. Download skipped.")
 
 
 class KGDockerEnv(DockerEnv):
