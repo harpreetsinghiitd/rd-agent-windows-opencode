@@ -9,7 +9,7 @@ WHERE TO TYPE THE PROMPT
 Use the OpenCode chat, not the RD-Agent browser UI:
 
 1. Open the RD-Agent folder in OpenCode:
-   C:\Users\HP\Downloads\RD-Agent
+   <path-to-your-RD-Agent-clone>
 2. Make sure OpenCode is signed in to the provider/model you want to use, and Docker Desktop is running with its Linux engine.
 3. In the OpenCode chat message box, type /rdagent and then describe your task. Example:
 
@@ -56,11 +56,11 @@ For your own dataset, first inspect the DataScience scenario/configuration and a
 LIMITS / SAFETY
 
 - Windows support is a locally tested port, not a claim of complete upstream support; upstream documents Linux-only support.
-- The full RD-Agent data-science loop was not verified end-to-end. 175 bounded regression tests passed, with 2 skipped; that does not mean every workflow is supported.
+- The full RD-Agent data-science loop was not verified end-to-end. 186 bounded offline regression tests passed, with 2 skipped (re-run 2026-11-18); that does not mean every workflow is supported.
 - Never run the ARF/Medical scenario for this setup; it contains clinical data and is outside scope.
 - WIC/finance support is not complete. The Qlib path is primarily China-equity-oriented and does not provide an options-chain backtester, options pricing/fills, or an Interactive Brokers order adapter. No WIC strategy or NVDA/US-market backtest has been validated.
 - Qlib setup no longer downloads China market data implicitly. Provide compatible local Qlib data explicitly; legacy China data download is available only with `QLIB_DOCKER_AUTO_DOWNLOAD_CN_DATA=True`. Factor/quant scenarios require compatible prebuilt factor `.h5` files in `FACTOR_COSTEER_DATA_FOLDER` and `FACTOR_COSTEER_DATA_FOLDER_DEBUG`; they no longer generate all-market data during scenario startup.
 - WIC Trader research/decision support and AI Agent autonomous trading have different rules. Do not connect a live TWS account, submit orders, or use the OpenCode provider for WIC live AI decisions. The AI Agent division requires the organizer-approved LLM route and a declared/frozen model/tool setup; these details and usable historical options data are not configured here.
 - Keep .env, datasets, logs, and generated artifacts private and out of commits.
 
-The integration changes are committed locally as 98924a8. They have not been pushed to GitHub.
+For an overview of the whole port (architecture, fixes, verification and roadmap), see README.md.
