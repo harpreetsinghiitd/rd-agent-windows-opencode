@@ -1,0 +1,42 @@
+name: windows-offline-tests
+
+# Runs the bounded offline suite used for the Windows/OpenCode port
+# (mocks and temp fixtures only: no network, no Docker, no live LLM).
+# The upstream full suite is intentionally not run here; most of it needs
+# live LLMs, Docker images, Qlib data or Linux paths.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  offline-tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install package and test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest
+      - name: Run offline regression suite
+        run: >
+          python -m pytest -q
+          test/utils/test_import_paths.py
+          test/utils/test_archive_security.py
+          test/utils/test_conda_security.py
+          test/utils/test_docker_reconnect.py
+          test/utils/test_artifact_transport.py
+          test/utils/test_env_windows.py
+          test/utils/test_env_posix_volumes.py
+          test/utils/test_console_encoding.py
+          test/scenarios/data_science/test_secure_parsing.py
+          test/scenarios/data_science/test_debug_data.py
+          test/scenarios/qlib/test_no_implicit_data_download.py
+          test/log/server/test_security.py
+          test/oai/test_base.py
+          test/oai/test_opencode_backend.py
